@@ -12,13 +12,14 @@ import java.util.concurrent.CancellationException
 import cats.effect.std.CountDownLatch
 import cats.effect.unsafe.implicits.global
 import cats.effect.IO
+import fs2.concurrent.Channel
 import fs2.kafka.*
 import fs2.kafka.internal.syntax.*
-import fs2.kafka.BaseSpec
 
 import org.apache.kafka.common.header.internals.RecordHeaders
 import org.apache.kafka.common.internals.KafkaFutureImpl
 import org.apache.kafka.common.KafkaFuture
+import org.scalatest.time.SpanSugar.convertIntToGrainOfTime
 
 final class SyntaxSpec extends BaseSpec {
 
@@ -85,6 +86,17 @@ final class SyntaxSpec extends BaseSpec {
           _     <- IO(assert(isFutureCancelled.get))
         } yield ()
       test.unsafeRunSync()
+    }
+
+    it("playground") {
+      (for {
+        channel <- Channel.unbounded[IO, String]
+        _       <- channel.send("hola")
+        _       <- channel.send("adios")
+        _       <- IO.sleep(5.seconds)
+        _       <- channel.stream.take(2).foreach(s => IO.println(s)).compile.drain.timeout(10.seconds)
+      } yield ()).unsafeRunSync()
+
     }
   }
 

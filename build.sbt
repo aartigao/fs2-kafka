@@ -18,6 +18,8 @@ val vulcanVersion = "1.10.1"
 
 val munitVersion = "0.7.29"
 
+val weaverVersion = "0.8.3"
+
 val scala212 = "2.12.18"
 
 val scala213 = "2.13.12"
@@ -111,12 +113,13 @@ lazy val docs = project
 lazy val dependencySettings = Seq(
   resolvers += "confluent".at("https://packages.confluent.io/maven/"),
   libraryDependencies ++= Seq(
-    "com.dimafeng"  %% "testcontainers-scala-scalatest" % testcontainersScalaVersion,
-    "com.dimafeng"  %% "testcontainers-scala-kafka"     % testcontainersScalaVersion,
-    "org.typelevel" %% "discipline-scalatest"           % disciplineVersion,
-    "org.typelevel" %% "cats-effect-laws"               % catsEffectVersion,
-    "org.typelevel" %% "cats-effect-testkit"            % catsEffectVersion,
-    "ch.qos.logback" % "logback-classic"                % logbackVersion
+    "com.disneystreaming" %% "weaver-cats"                    % weaverVersion,
+    "com.dimafeng"        %% "testcontainers-scala-scalatest" % testcontainersScalaVersion,
+    "com.dimafeng"        %% "testcontainers-scala-kafka"     % testcontainersScalaVersion,
+    "org.typelevel"       %% "discipline-scalatest"           % disciplineVersion,
+    "org.typelevel"       %% "cats-effect-laws"               % catsEffectVersion,
+    "org.typelevel"       %% "cats-effect-testkit"            % catsEffectVersion,
+    "ch.qos.logback"       % "logback-classic"                % logbackVersion
   ).map(_ % Test),
   libraryDependencies ++= {
     if (scalaVersion.value.startsWith("3")) Nil
@@ -319,7 +322,8 @@ lazy val scalaSettings = Seq(
 lazy val testSettings = Seq(
   Test / logBuffered       := false,
   Test / parallelExecution := false,
-  Test / testOptions       += Tests.Argument("-oDF")
+  Test / testOptions       += Tests.Argument("-oDF"),
+  testFrameworks           += new TestFramework("weaver.framework.CatsEffect")
 )
 
 def minorVersion(version: String): String = {

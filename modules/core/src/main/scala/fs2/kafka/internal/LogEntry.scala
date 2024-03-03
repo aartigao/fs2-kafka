@@ -10,6 +10,7 @@ import java.util.regex.Pattern
 
 import scala.collection.immutable.SortedSet
 
+import cats.*
 import cats.data.{Chain, NonEmptyList, NonEmptySet, NonEmptyVector}
 import cats.syntax.all.*
 import fs2.kafka.instances.*
@@ -31,15 +32,15 @@ sealed abstract private[kafka] class LogEntry {
 
 private[kafka] object LogEntry {
 
-  final case class SubscribedTopics[F[_]](
-    topics: NonEmptyList[String],
-    state: State[F, ?, ?]
+  final case class SubscribedTopics[G[_]: Reducible, State: Show](
+    topics: G[String],
+    state: State
   ) extends LogEntry {
 
     override def level: LogLevel = Debug
 
     override def message: String =
-      s"Consumer subscribed to topics [${topics.toList.mkString(", ")}]. Current state [$state]."
+      show"Consumer subscribed to topics [${topics.mkString_(", ")}]. Current state [$state]."
 
   }
 
@@ -55,26 +56,26 @@ private[kafka] object LogEntry {
 
   }
 
-  final case class SubscribedPattern[F[_]](
+  final case class SubscribedPattern[State: Show](
     pattern: Pattern,
-    state: State[F, ?, ?]
+    state: State
   ) extends LogEntry {
 
     override def level: LogLevel = Debug
 
     override def message: String =
-      s"Consumer subscribed to pattern [$pattern]. Current state [$state]."
+      s"Consumer subscribed to pattern [$pattern]. Current state [${state.show}]."
 
   }
 
-  final case class Unsubscribed[F[_]](
-    state: State[F, ?, ?]
+  final case class Unsubscribed[State: Show](
+    state: State
   ) extends LogEntry {
 
     override def level: LogLevel = Debug
 
     override def message: String =
-      s"Consumer unsubscribed from all partitions. Current state [$state]."
+      show"Consumer unsubscribed from all partitions. Current state [$state]."
 
   }
 
@@ -103,27 +104,27 @@ private[kafka] object LogEntry {
 
   }
 
-  final case class AssignedPartitions[F[_]](
+  final case class AssignedPartitions[State: Show](
     partitions: SortedSet[TopicPartition],
-    state: State[F, ?, ?]
+    state: State
   ) extends LogEntry {
 
     override def level: LogLevel = Debug
 
     override def message: String =
-      s"Assigned partitions [${partitions.mkString(", ")}]. Current state [$state]."
+      s"Assigned partitions [${partitions.mkString(", ")}]. Current state [${state.show}]."
 
   }
 
-  final case class RevokedPartitions[F[_]](
+  final case class RevokedPartitions[State: Show](
     partitions: SortedSet[TopicPartition],
-    state: State[F, ?, ?]
+    state: State
   ) extends LogEntry {
 
     override def level: LogLevel = Debug
 
     override def message: String =
-      s"Revoked partitions [${partitions.mkString(", ")}]. Current state [$state]."
+      s"Revoked partitions [${partitions.mkString(", ")}]. Current state [${state.show}]."
 
   }
 

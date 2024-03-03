@@ -16,6 +16,7 @@ import cats.effect.*
 import cats.effect.std.*
 import cats.effect.syntax.all.*
 import cats.syntax.all.*
+import cats.Show
 import fs2.kafka.*
 import fs2.kafka.instances.*
 import fs2.kafka.internal.converters.collection.*
@@ -608,6 +609,8 @@ private[kafka] object KafkaConsumerActor {
         subscribed = false,
         streaming = false
       )
+
+    implicit def show[F[_], K, V]: Show[State[F, K, V]] = Show.fromToString
 
   }
 

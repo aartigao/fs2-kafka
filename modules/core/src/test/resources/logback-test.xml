@@ -6,6 +6,8 @@
     </encoder>
   </appender>
 
+  <logger name="fs2.kafka" level="DEBUG" />
+
   <root level="INFO" additivity="false">
     <appender-ref ref="STDOUT"/>
   </root>
