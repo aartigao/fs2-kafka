@@ -7,6 +7,7 @@
   </appender>
 
   <logger name="fs2.kafka" level="DEBUG" />
+<!--  <logger name="org.apache.kafka" level="TRACE" />-->
 
   <root level="INFO" additivity="false">
     <appender-ref ref="STDOUT"/>

@@ -34,7 +34,8 @@ final class KafkaConsumerSpec extends BaseKafkaSpec {
             _           <- Stream.eval(consumer.subscribe(NonEmptyList.one(topic)))
             committable <- consumer.records
           } yield committable.record.key -> committable.record.value)
-            .interruptAfter(10.seconds)
+//            .interruptAfter(5.seconds)
+            .take(5)
             .compile
             .toVector
             .unsafeRunSync()

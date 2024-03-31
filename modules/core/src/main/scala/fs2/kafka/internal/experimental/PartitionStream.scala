@@ -8,10 +8,12 @@ package fs2.kafka.internal.experimental
 
 import cats.*
 import cats.effect.*
+import cats.effect.kernel.Resource.ExitCase
 import cats.effect.std.*
 import cats.syntax.all.*
 import fs2.*
 import fs2.concurrent.*
+import fs2.kafka.instances.*
 import fs2.kafka.internal.experimental.KafkaConsumer.Request
 import fs2.kafka.internal.experimental.PartitionStream.Status
 import fs2.kafka.CommittableConsumerRecord
@@ -25,23 +27,33 @@ class PartitionStream[F[_], K, V](
 )(implicit F: Async[F]) {
 
   private val pauseSignal     = status.map(_ == Status.Paused)
-  private val interruptSignal = status.map(_ == Status.Stopped)
+  private val interruptSignal = status.map(_ == Status.Stopping)
 
-  def create: Stream[F, CommittableConsumerRecord[F, K, V]] =
+  def create(
+    prefetch: Int,
+    onFinish: Status => F[Unit]
+  ): Stream[F, CommittableConsumerRecord[F, K, V]] =
     Stream.exec(transitionTo(Status.Running)) ++
       status
         .continuous
-        .takeWhile(_.isNotFinished)
+        .takeWhile(_.isNotFinish)
         .evalMap { _ =>
           F.async[Chunk[CommittableConsumerRecord[F, K, V]]] { cb =>
             store(Request.Fetch(partition, cb)).as(Some(F.unit))
           }
         }
-        .debugChunks()
+        .prefetchN(prefetch)
+//        .debugChunks()
         .unchunks
         .pauseWhen(pauseSignal)
         .interruptWhen(interruptSignal)
-        .onFinalize(transitionTo(Status.Init).flatTap(_ => F.pure(println(s"Finalizing $this"))))
+        .onFinalizeCase(exit => onExitTransition(exit) >>= onFinish)
+
+  private[this] def onExitTransition(exit: ExitCase): F[Status] = exit match {
+    case ExitCase.Succeeded  => transitionTo(Status.Completed).as(Status.Completed)
+    case ExitCase.Canceled   => transitionTo(Status.Stopped).as(Status.Stopped)
+    case _: ExitCase.Errored => transitionTo(Status.Failed).as(Status.Failed)
+  }
 
   def isInit: F[Boolean] = status.get.map(_ == Status.Init)
 
@@ -51,20 +63,23 @@ class PartitionStream[F[_], K, V](
 
   def resume: F[Unit] = transitionTo(Status.Running)
 
-  def stop: F[Unit] = transitionTo(Status.Stopped) *> status.waitUntil(_ == Status.Init)
+  def stop: F[Unit] = transitionTo(Status.Stopping) *> status.waitUntil(_.isFinished)
 
-  def close: F[Unit] = transitionTo(Status.Closed) *> status.waitUntil(_ == Status.Init)
+  def close: F[F[Unit]] = transitionTo(Status.Closing).as(status.waitUntil(_.isFinished))
 
-  private def transitionTo(newState: Status): F[Unit] =
+  private def transitionTo(newStatus: Status): F[Unit] =
     status
       .get
-      .flatMap { currentState =>
-        if (currentState.isTransitionAllowed(newState)) status.set(newState)
+      .flatTap(status => F.pure(println(s"$this -> From $status to $newStatus")))
+      .flatMap { currentStatus =>
+        if (currentStatus.isTransitionAllowed(newStatus)) status.set(newStatus)
         else
           F.raiseError(
-            new IllegalStateException(s"Invalid transition from $currentState to $newState")
+            new IllegalStateException(s"Invalid transition from $currentStatus to $newStatus")
           )
       }
+
+  override def toString: String = show"PartitionStream($partition)"
 
 }
 
@@ -74,32 +89,43 @@ object PartitionStream {
 
     def isTransitionAllowed(status: Status): Boolean =
       (self, status) match {
-        case (Status.Init, Status.Running)   => true
-        case (Status.Running, Status.Paused) => true
-        case (Status.Running, Status.Closed) => true
-        case (Status.Paused, Status.Running) => true
-        case (Status.Paused, Status.Stopped) => true
-        case (_, Status.Init)                => true
-        case (x, y) if x === y               => true
-        case _                               => false
+        case (Status.Init, Status.Running)    => true
+        case (Status.Running, Status.Paused)  => true
+        case (Status.Running, Status.Closing) => true
+        case (Status.Paused, Status.Running)  => true
+        case (Status.Paused, Status.Stopping) => true
+        case (_, Status.Completed)            => true
+        case (_, Status.Stopped)              => true
+        case (_, Status.Failed)               => true
+        case (x, y) if x === y                => true
+        case _                                => false
       }
 
-    def isNotFinished: Boolean = self match {
-      case Status.Stopped | Status.Closed => false
-      case _                              => true
+    def isFinished: Boolean = self match {
+      case Status.Completed | Status.Failed | Status.Stopped => true
+      case _                                                 => false
+    }
+
+    def isNotFinish: Boolean = self match {
+      case Status.Stopping | Status.Closing => false
+      case _                                => !isFinished
     }
 
   }
 
   object Status {
 
-    case object Init    extends Status
-    case object Running extends Status
-    case object Paused  extends Status
-    case object Stopped extends Status
-    case object Closed  extends Status
+    case object Init      extends Status
+    case object Running   extends Status
+    case object Paused    extends Status
+    case object Closing   extends Status
+    case object Stopping  extends Status
+    case object Completed extends Status
+    case object Stopped   extends Status
+    case object Failed    extends Status
 
-    implicit val eq: Eq[Status] = Eq.fromUniversalEquals
+    implicit val eq: Eq[Status]     = Eq.fromUniversalEquals
+    implicit val show: Show[Status] = Show.fromToString
 
   }
 

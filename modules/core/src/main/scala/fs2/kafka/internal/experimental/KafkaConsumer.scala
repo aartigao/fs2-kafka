@@ -49,9 +49,6 @@ class KafkaConsumer[F[_], K, V](
     with KafkaSubscription[F]
     with KafkaCommit[F] {
 
-  private[this] type ConsumerRecords =
-    Map[TopicPartition, Chunk[CommittableConsumerRecord[F, K, V]]]
-
   private[this] val consumerGroupId: Option[String] =
     settings.properties.get(ConsumerConfig.GROUP_ID_CONFIG)
 
@@ -63,13 +60,14 @@ class KafkaConsumer[F[_], K, V](
       override def onPartitionsRevoked(partitions: util.Collection[TopicPartition]): Unit =
         exec(partitions)(revoked)
 
+      // TODO The pause flag in partitions [{}] will be removed due to revocation
       override def onPartitionsAssigned(partitions: util.Collection[TopicPartition]): Unit =
         exec(partitions)(assigned)
 
       override def onPartitionsLost(partitions: util.Collection[TopicPartition]): Unit =
         exec(partitions)(lost)
 
-      private def exec(
+      @inline private def exec(
         partitions: util.Collection[TopicPartition]
       )(f: SortedSet[TopicPartition] => F[Unit]): Unit =
         dispatcher.unsafeRunSync(f(partitions.toSortedSet))
@@ -105,13 +103,20 @@ class KafkaConsumer[F[_], K, V](
 
   override def unsubscribe: F[Unit] =
     state
-      .evalUpdateAndGet { state =>
-        withConsumer
-          .blocking(_.unsubscribe())
-          .productR(state.assigned.values.toList.traverse_(_.close))
-          .as(State.empty)
+      .get
+      .flatMap { state =>
+        this
+          .state
+          .evalUpdateAndGet { state =>
+            transitionTo(state, Status.Unsubscribed) {
+              state.assigned.values.toList.traverse_(_.close) >>
+
+              withConsumer.blocking(_.unsubscribe)
+            }.as(State.empty)
+          }
+          .log(LogEntry.Unsubscribed(_))
+          .whenA(state.status == Status.Unsubscribed) // We can unsubscribe as much times as we want
       }
-      .log(LogEntry.Unsubscribed(_))
 
   override def stream: Stream[F, CommittableConsumerRecord[F, K, V]] =
     partitionedStream.parJoinUnbounded
@@ -123,17 +128,26 @@ class KafkaConsumer[F[_], K, V](
     : Stream[F, Map[TopicPartition, Stream[F, CommittableConsumerRecord[F, K, V]]]] =
     Stream
       .resource(assignments.subscribeAwaitUnbounded)
-      .flatMap { subscription =>
-        subscription
-          .map(_.map { case (partition, stream) => partition -> stream.create })
+      .flatMap { assignmentsStream =>
+        assignmentsStream
+          .map { assignment =>
+            assignment.map { case (partition, stream) =>
+              partition -> stream.create(settings.maxPrefetchBatches, clean(partition))
+            }
+          }
           .concurrently(
             Stream(
-              Stream(Request.Poll).covary[F].repeat.debounce(settings.pollInterval),
+              Stream.fixedRateStartImmediately(settings.pollInterval).as(Request.Poll),
               Stream.fromQueueUnterminated(requests)
             ).parJoin(2).foreach(handle)
           )
       }
       .onFinalize(unsubscribe) // Ensure clean state after interruption/error
+
+  private[this] def clean(partition: TopicPartition)(status: PartitionStream.Status): F[Unit] =
+    state
+      .updateAndGet(state => state.withoutAssignment(partition))
+      .log(LogEntry.FinishedPartitionStream(partition, status, _))
 
   private[this] def handle(request: Request[F, K, V]): F[Unit] = request match {
     case Request.Poll              => handlePoll
@@ -148,7 +162,9 @@ class KafkaConsumer[F[_], K, V](
       // TODO Descartar fetch para particiones no asignadas (o paradas)
     }
 
-  private[this] val handlePoll: F[Unit] =
+  private[this] val handlePoll: F[Unit] = pollForFetches >>= completeFetches
+
+  private[this] def pollForFetches: F[KafkaByteConsumerRecords] =
     state
       .get
       .flatMap { state =>
@@ -163,50 +179,66 @@ class KafkaConsumer[F[_], K, V](
           if (resume.nonEmpty)
             consumer.resume(resume.asJava)
 
+          // Here lies the streaming laziness magic that allows this library to backpressure records
+          // If the partition stream has not requested a fetch, pausing that partition means `poll` will
+          // not return records for it, thus, we only emit records for partitions that have asked for them
           if (pause.nonEmpty)
             consumer.pause(pause.asJava)
 
-          println(s"Pause: $pause")
-          println(s"Resume: $resume")
-          val records = consumer.poll(pollTimeout)
-
-          val returned    = records.partitions.toSet
-          val unsolicited = returned &~ requested
-
-          // Instead of storing unsolicited records, we reposition the fetch offset, effectively discarding
-          // the records. This should happen very rarely, only in the event of a rebalance.
-          unsolicited.foreach { partition =>
-            records
-              .records(partition)
-              .toList
-              .headOption
-              .foreach { record =>
-                consumer.seek(partition, record.offset)
-              }
-          }
-
-          (returned -- unsolicited)
-            .view
-            .map(partition => partition -> records.records(partition).toList)
-            .toList
+//          println(s"Pause: $pause")
+//          println(s"Resume: $resume")
+          consumer.poll(pollTimeout)
         }
       }
-      .flatMap(committableConsumerRecords)
-      .flatMap(completeFetches)
+
+  private[this] def completeFetches(records: KafkaByteConsumerRecords): F[Unit] =
+    state
+      .evalUpdate { state =>
+        val requested   = state.fetches.keySet
+        val returned    = records.partitions.toSet
+        val solicited   = returned & requested
+        val unsolicited = returned -- solicited
+
+        // Instead of storing unsolicited records, we reposition the fetch offset, effectively discarding
+        // the records. This should happen very rarely, only in the event of a rebalance.
+        if (unsolicited.nonEmpty) {
+          withConsumer.blocking { consumer =>
+            unsolicited.foreach { partition =>
+              records
+                .records(partition)
+                .toList
+                .headOption
+                .foreach { record =>
+                  consumer.seek(partition, record.offset)
+                }
+            }
+          }
+        }
+
+        committableConsumerRecords(records, solicited).map(state.completeFetches)
+      }
+      .whenA(!records.isEmpty) // Keep same state if nothing returned from `poll`
 
   private[this] def committableConsumerRecords(
-    records: List[(TopicPartition, List[KafkaByteConsumerRecord])]
+    batch: KafkaByteConsumerRecords,
+    solicited: Set[TopicPartition]
   ): F[List[(TopicPartition, Chunk[CommittableConsumerRecord[F, K, V]])]] =
-    records.traverse { case (partition, recs) =>
-      Chunk
-        .from(recs)
-        .traverse { rec =>
-          ConsumerRecord
-            .fromJava(rec, keyDeserializer, valueDeserializer)
-            .map(committableConsumerRecord(_, partition))
-        }
-        .fmap(partition -> _)
-    }
+    Stream
+      .iterable(solicited)
+      .parEvalMapUnorderedUnbounded { partition =>
+        // Deserializing records is a CPU-demanding task (whether JSON/Avro/Protobuf is used)
+        // For this reason we parallelize the deserialization of each partition-chunked records
+        Chunk
+          .from(batch.records(partition).toVector)
+          .traverse { rec =>
+            ConsumerRecord
+              .fromJava(rec, keyDeserializer, valueDeserializer)
+              .map(committableConsumerRecord(_, partition))
+          }
+          .map(partition -> _)
+      }
+      .compile
+      .toList
 
   private[this] def committableConsumerRecord(
     record: ConsumerRecord[K, V],
@@ -224,11 +256,6 @@ class KafkaConsumer[F[_], K, V](
         commit = commitAsync
       )
     )
-
-  private[this] def completeFetches(
-    records: List[(TopicPartition, Chunk[CommittableConsumerRecord[F, K, V]])]
-  ): F[Unit] =
-    state.update(state => state.completeFetches(records.toMap.lift))
 
   override def commitAsync(offsets: Map[TopicPartition, OffsetAndMetadata]): F[Unit] =
     commitWithRecovery(
@@ -267,7 +294,7 @@ class KafkaConsumer[F[_], K, V](
   ): F[Unit] =
     commit.handleErrorWith(settings.commitRecovery.recoverCommitWith(offsets, commit))
 
-  override def stopConsuming: F[Unit] = unsubscribe // TODO Close `records` stream
+  override def stopConsuming: F[Unit] = F.blocking(println("Muerto")) *> unsubscribe // TODO Close `records` stream
 
   private[this] def transitionTo[A](state: State[F, K, V], status: Status)(
     f: F[A]
@@ -302,19 +329,34 @@ class KafkaConsumer[F[_], K, V](
 
   /**
     * Depending on the partition assignor used, it will revoke all the partitions before reassigning
-    * them (eager) or revoke only the ones reassigned to other consumer (cooperative). At this point
-    * we don't know if a revoked partition will be reassigned immediately, thus we pause them
-    * preemptively, avoiding finishing the selected partition streams.
+    * them (eager) or revoke only the ones reassigned to other consumer (cooperative).
+    *
+    * Anyways, a revoked partition won't be owned by the consumer until it's reassigned (even if
+    * reassigned to the same consumer). The right choice here is to gracefully stop the stream,
+    * waiting for all the pending records to be processed, then process the stashed commits.
+    *
     * @see
     *   org.apache.kafka.clients.consumer.ConsumerPartitionAssignor.RebalanceProtocol
     */
-  private[this] def revoked(revoked: SortedSet[TopicPartition]): F[Unit] =
+  private[this] def revoked(revoked: SortedSet[TopicPartition]): F[Unit] = {
     state
-      .get
-      .flatTap { state =>
-        state.assigned.view.filterKeys(revoked).values.toList.traverse_(_.pause)
+      .evalModify { state =>
+        state
+          .assigned
+          .view
+          .filterKeys(revoked)
+          .values
+          .toList
+          .traverse(_.close)
+          .map { cbClosingStreams =>
+            val newState = state.voidFetches(revoked).withoutAssignments(revoked)
+            (newState, cbClosingStreams)
+          }
       }
+      .flatMap(_.sequence_)
+      .flatMap(_ => state.get) // TODO Commit stashed offsets here
       .log(LogEntry.RevokedPartitions(revoked, _))
+  }
 
   private[this] def lost(lost: SortedSet[TopicPartition]): F[Unit] =
     F.raiseError(new UnsupportedOperationException) // TODO
@@ -341,11 +383,12 @@ object KafkaConsumer {
     // TODO Permitir suscribirse multiples veces?
     def isTransitionAllowed(status: Status): Boolean =
       (self, status) match {
-        case (Status.Unsubscribed, Status.Subscribed) => true
-        case (Status.Subscribed, Status.Streaming)    => true
-        case (Status.Subscribed, Status.Unsubscribed) => true
-        case (Status.Streaming, Status.Unsubscribed)  => true
-        case _                                        => false
+        case (Status.Unsubscribed, Status.Subscribed)   => true
+        case (Status.Subscribed, Status.Streaming)      => true
+        case (Status.Subscribed, Status.Unsubscribed)   => true
+        case (Status.Streaming, Status.Unsubscribed)    => true
+        case (Status.Unsubscribed, Status.Unsubscribed) => true // FIXME
+        case _                                          => false
       }
 
   }
@@ -360,7 +403,6 @@ object KafkaConsumer {
 
   }
 
-  // TODO Prefetch
   final case class State[F[_], K, V](
     assigned: Map[TopicPartition, PartitionStream[F, K, V]],
     fetches: Map[
@@ -376,8 +418,19 @@ object KafkaConsumer {
     ): State[F, K, V] =
       if (assigned.contains(partition)) this else copy(assigned = assigned + (partition -> stream))
 
-    def withoutAssignment(partition: TopicPartition): State[F, K, V] =
-      if (!assigned.contains(partition)) this else copy(assigned = assigned - partition)
+    def withoutAssignment(partition: TopicPartition): State[F, K, V] = {
+      val isAssigned = assigned.contains(partition)
+      val hasFetch   = fetches.contains(partition)
+      if (!isAssigned && !hasFetch) this
+      else {
+        val _assigned = if (!isAssigned) assigned else assigned - partition
+        val _fetches  = if (!hasFetch) fetches else fetches - partition
+        copy(assigned = _assigned, fetches = _fetches)
+      }
+    }
+
+    def withoutAssignments(partitions: Iterable[TopicPartition]): State[F, K, V] =
+      partitions.foldLeft(this)(_ withoutAssignment _)
 
     def withFetch(
       partition: TopicPartition,
@@ -388,16 +441,20 @@ object KafkaConsumer {
     def withoutFetches(partitions: Iterable[TopicPartition]): State[F, K, V] =
       copy(fetches = fetches -- partitions)
 
+    def voidFetches(partitions: Iterable[TopicPartition]): State[F, K, V] =
+      completeFetches(partitions.toList.map(_ -> Chunk.empty))
+
     def completeFetches(
-      f: TopicPartition => Option[Chunk[CommittableConsumerRecord[F, K, V]]]
+      records: List[(TopicPartition, Chunk[CommittableConsumerRecord[F, K, V]])]
     ): State[F, K, V] = {
-      val completed = fetches
-        .toList
-        .mapFilter { case (partition, cb) =>
-          f(partition).map { records =>
-            cb(Right(records))
-            partition
-          }
+      val completed =
+        records.mapFilter { case (partition, recs) =>
+          fetches
+            .get(partition)
+            .map { cb =>
+              cb(Right(recs))
+              partition
+            }
         }
       if (completed.isEmpty) this else copy(fetches = fetches -- completed)
     }
@@ -430,7 +487,7 @@ object KafkaConsumer {
   )(implicit
     F: Async[F],
     mk: MkConsumer[F]
-  ): Resource[F, KafkaConsumer[F, K, V]] =
+  ): Resource[F, KafkaConsumer[F, K, V]] = {
     for {
       keyDeserializer   <- settings.keyDeserializer
       valueDeserializer <- settings.valueDeserializer
@@ -457,5 +514,6 @@ object KafkaConsumer {
                     )
                   )(_.stopConsuming) // TODO Testear resource.release graceful (cuando no se interrumpe el stream directamente)
     } yield consumer
+  }
 
 }

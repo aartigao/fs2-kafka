@@ -14,6 +14,7 @@ import cats.*
 import cats.data.{Chain, NonEmptyList, NonEmptySet, NonEmptyVector}
 import cats.syntax.all.*
 import fs2.kafka.instances.*
+import fs2.kafka.internal.experimental.PartitionStream
 import fs2.kafka.internal.syntax.*
 import fs2.kafka.internal.KafkaConsumerActor.*
 import fs2.kafka.internal.LogLevel.*
@@ -31,6 +32,19 @@ sealed abstract private[kafka] class LogEntry {
 }
 
 private[kafka] object LogEntry {
+
+  final case class FinishedPartitionStream[State: Show](
+    partition: TopicPartition,
+    status: PartitionStream.Status,
+    state: State
+  ) extends LogEntry {
+
+    override def level: LogLevel = Debug
+
+    override def message: String =
+      show"Partition stream for $partition finished with status $status. Current state [$state]."
+
+  }
 
   final case class SubscribedTopics[G[_]: Reducible, State: Show](
     topics: G[String],
