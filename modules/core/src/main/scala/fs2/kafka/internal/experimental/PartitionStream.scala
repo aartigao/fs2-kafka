@@ -9,41 +9,37 @@ package fs2.kafka.internal.experimental
 import cats.*
 import cats.effect.*
 import cats.effect.kernel.Resource.ExitCase
-import cats.effect.std.*
 import cats.syntax.all.*
 import fs2.*
 import fs2.concurrent.*
+import fs2.kafka.{CommittableConsumerRecord, ConsumerSettings}
 import fs2.kafka.instances.*
-import fs2.kafka.internal.experimental.KafkaConsumer.Request
-import fs2.kafka.internal.experimental.PartitionStream.Status
-import fs2.kafka.CommittableConsumerRecord
+import fs2.kafka.internal.experimental.PartitionStream.{FetchCallback, Status}
 
 import org.apache.kafka.common.TopicPartition
 
 class PartitionStream[F[_], K, V](
-  partition: TopicPartition,
-  store: Request.Fetch[F, K, V] => F[Unit],
+  settings: ConsumerSettings[F, K, V],
+  storeFetch: FetchCallback[F, K, V] => F[Unit],
+  onFinish: Status => F[Unit],
   status: SignallingRef[F, Status]
 )(implicit F: Async[F]) {
 
   private val pauseSignal     = status.map(_ == Status.Paused)
   private val interruptSignal = status.map(_ == Status.Stopping)
 
-  def create(
-    prefetch: Int,
-    onFinish: Status => F[Unit]
-  ): Stream[F, CommittableConsumerRecord[F, K, V]] =
+  def create: Stream[F, CommittableConsumerRecord[F, K, V]] =
     Stream.exec(transitionTo(Status.Running)) ++
       status
         .continuous
         .takeWhile(_.isNotFinish)
         .evalMap { _ =>
           F.async[Chunk[CommittableConsumerRecord[F, K, V]]] { cb =>
-            store(Request.Fetch(partition, cb)).as(Some(F.unit))
+            storeFetch(cb).as(Some(F.unit))
           }
         }
-        .prefetchN(prefetch)
-//        .debugChunks()
+        .debugChunks()
+        .prefetchN(settings.maxPrefetchBatches - 1)
         .unchunks
         .pauseWhen(pauseSignal)
         .interruptWhen(interruptSignal)
@@ -63,11 +59,14 @@ class PartitionStream[F[_], K, V](
 
   def resume: F[Unit] = transitionTo(Status.Running)
 
-  def stop: F[Unit] = transitionTo(Status.Stopping) *> status.waitUntil(_.isFinished)
+  def stop: F[Status] = transitionToFinish(Status.Stopping).flatten
 
-  def close: F[F[Unit]] = transitionTo(Status.Closing).as(status.waitUntil(_.isFinished))
+  def close: F[F[Status]] = transitionToFinish(Status.Closing)
 
-  private def transitionTo(newStatus: Status): F[Unit] =
+  private[this] def transitionToFinish(newStatus: Status): F[F[Status]] =
+    transitionTo(newStatus).as(status.waitUntil(_.isFinished) >> status.get)
+
+  private[this] def transitionTo(newStatus: Status): F[Unit] =
     status
       .get
       .flatTap(status => F.pure(println(s"$this -> From $status to $newStatus")))
@@ -79,11 +78,12 @@ class PartitionStream[F[_], K, V](
           )
       }
 
-  override def toString: String = show"PartitionStream($partition)"
-
 }
 
 object PartitionStream {
+
+  type FetchCallback[F[_], K, V] =
+    Either[Throwable, Chunk[CommittableConsumerRecord[F, K, V]]] => Unit
 
   sealed trait Status { self =>
 
@@ -130,11 +130,12 @@ object PartitionStream {
   }
 
   def apply[F[_]: Async, K, V](
-    partition: TopicPartition,
-    requests: Queue[F, Request[F, K, V]]
+    settings: ConsumerSettings[F, K, V],
+    storeFetch: FetchCallback[F, K, V] => F[Unit],
+    onFinish: Status => F[Unit]
   ): F[PartitionStream[F, K, V]] =
     SignallingRef
       .of[F, Status](Status.Init)
-      .map(state => new PartitionStream(partition, requests.offer, state))
+      .map(state => new PartitionStream(settings, storeFetch, onFinish, state))
 
 }

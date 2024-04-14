@@ -34,13 +34,32 @@ final class KafkaConsumerSpec extends BaseKafkaSpec {
             _           <- Stream.eval(consumer.subscribe(NonEmptyList.one(topic)))
             committable <- consumer.records
           } yield committable.record.key -> committable.record.value)
-//            .interruptAfter(5.seconds)
-            .take(5)
+            .interruptAfter(5.seconds)
             .compile
             .toVector
             .unsafeRunSync()
 
         consumed should contain theSameElementsAs produced
+      }
+    }
+    it("should consume all records with subscribe 2") {
+      withTopic { topic =>
+        createCustomTopic(topic, partitions = 3)
+
+        val produced = (0 until 5).map(n => s"key-$n" -> s"value->$n")
+        publishToKafka(topic, produced)
+
+        val consumed =
+          KafkaConsumer
+            .resource(consumerSettings[IO])
+            .use { consumer =>
+              (Stream.exec(consumer.subscribe(NonEmptyList.one(topic))) ++ consumer
+                .records ++ Stream.exec(IO.println("Hola!"))).compile.drain.start >>
+                IO.sleep(5.seconds)
+            }
+            .unsafeRunSync()
+
+        consumed shouldBe ()
       }
     }
   }

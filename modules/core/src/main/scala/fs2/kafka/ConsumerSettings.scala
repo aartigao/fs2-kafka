@@ -359,7 +359,7 @@ sealed abstract class ConsumerSettings[F[_], K, V] {
     * Note that prefetching cannot be disabled and is generally preferred since it yields improved
     * performance. The minimum value for this setting is `2`.
     */
-  def maxPrefetchBatches: Int
+  def maxPrefetchBatches: Int // TODO Why prefetch can't be disabled?
 
   /**
     * Creates a new [[ConsumerSettings]] with the specified value for [[maxPrefetchBatches]]. Note

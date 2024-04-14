@@ -106,6 +106,19 @@ private[kafka] object LogEntry {
 
   }
 
+  final case class StoredFetch2[F[_], K, V, State: Show](
+    partition: TopicPartition,
+    callback: PartitionStream.FetchCallback[F, K, V],
+    state: State
+  ) extends LogEntry {
+
+    override def level: LogLevel = Debug
+
+    override def message: String =
+      s"Stored fetch [$callback] for partition [$partition]. Current state [${state.show}]."
+
+  }
+
   final case class StoredOnRebalance[F[_]](
     onRebalance: OnRebalance[F],
     state: State[F, ?, ?]
