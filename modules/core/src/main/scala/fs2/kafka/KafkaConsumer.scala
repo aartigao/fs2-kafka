@@ -25,6 +25,7 @@ import fs2.kafka.consumer.KafkaConsumeChunk.CommitNow
 import fs2.kafka.instances.*
 import fs2.kafka.internal.*
 import fs2.kafka.internal.converters.collection.*
+import fs2.kafka.internal.experimental.KafkaConsumer as KafkaConsumerExperimental
 import fs2.kafka.internal.syntax.*
 import fs2.kafka.internal.KafkaConsumerActor.*
 import fs2.kafka.internal.LogEntry.{RevokedPreviousFetch, StoredFetch}
@@ -676,6 +677,15 @@ object KafkaConsumer {
     F: Async[F],
     mk: MkConsumer[F]
   ): Resource[F, KafkaConsumer[F, K, V]] =
+    if (settings.enableExperimentalConsumer) resourceExperimentalConsumer(settings)
+    else resourceClassicConsumer(settings)
+
+  private def resourceClassicConsumer[F[_], K, V](
+    settings: ConsumerSettings[F, K, V]
+  )(implicit
+    F: Async[F],
+    mk: MkConsumer[F]
+  ): Resource[F, KafkaConsumer[F, K, V]] =
     for {
       keyDeserializer       <- settings.keyDeserializer
       valueDeserializer     <- settings.valueDeserializer
@@ -714,6 +724,122 @@ object KafkaConsumer {
       withConsumer,
       stopConsumingDeferred
     )(F, logging)
+
+  private def resourceExperimentalConsumer[F[_]: Async: MkConsumer, K, V](
+    settings: ConsumerSettings[F, K, V]
+  ): Resource[F, KafkaConsumer[F, K, V]] =
+    KafkaConsumerExperimental
+      .resource(settings)
+      .map { experimental =>
+        new KafkaConsumer[F, K, V] {
+
+          override def assignment: F[SortedSet[TopicPartition]] = experimental.assignment
+
+          override def assignmentStream: Stream[F, SortedSet[TopicPartition]] = experimental
+            .assignmentStream
+
+          override def assign(partitions: NonEmptySet[TopicPartition]): F[Unit] = experimental
+            .assign(partitions)
+
+          override def assign(topic: String): F[Unit] = experimental.assign(topic)
+
+          override def commitAsync(offsets: Map[TopicPartition, OffsetAndMetadata]): F[Unit] =
+            experimental.commitAsync(offsets)
+
+          override def commitSync(offsets: Map[TopicPartition, OffsetAndMetadata]): F[Unit] =
+            experimental.commitSync(offsets)
+
+          override def stream: Stream[F, CommittableConsumerRecord[F, K, V]] = experimental.stream
+
+          override def partitionedStream: Stream[F, Stream[F, CommittableConsumerRecord[F, K, V]]] =
+            experimental.partitionedStream
+
+          override def partitionsMapStream
+            : Stream[F, Map[TopicPartition, Stream[F, CommittableConsumerRecord[F, K, V]]]] =
+            experimental.partitionsMapStream
+
+          override def stopConsuming: F[Unit] = experimental.stopConsuming
+
+          override def terminate: F[Unit] = experimental.terminate
+
+          override def awaitTermination: F[Unit] = experimental.awaitTermination
+
+          override def metrics: F[Map[MetricName, Metric]] = experimental.metrics
+
+          override def committed(
+            partitions: Set[TopicPartition]
+          ): F[Map[TopicPartition, OffsetAndMetadata]] = experimental.committed(partitions)
+
+          override def committed(
+            partitions: Set[TopicPartition],
+            timeout: FiniteDuration
+          ): F[Map[TopicPartition, OffsetAndMetadata]] = experimental.committed(partitions, timeout)
+
+          override def seek(partition: TopicPartition, offset: Long): F[Unit] = experimental
+            .seek(partition, offset)
+
+          override def seekToBeginning[G[_]: Foldable](partitions: G[TopicPartition]): F[Unit] =
+            experimental.seekToBeginning(partitions)
+
+          override def seekToEnd[G[_]: Foldable](partitions: G[TopicPartition]): F[Unit] =
+            experimental.seekToEnd(partitions)
+
+          override def position(partition: TopicPartition): F[Long] = experimental
+            .position(partition)
+
+          override def position(partition: TopicPartition, timeout: FiniteDuration): F[Long] =
+            experimental.position(partition, timeout)
+
+          override def subscribe[G[_]: Reducible](topics: G[String]): F[Unit] = experimental
+            .subscribe(topics)
+
+          override def subscribe(regex: Regex): F[Unit] = experimental.subscribe(regex)
+
+          override def unsubscribe: F[Unit] = experimental.unsubscribe
+
+          override def listTopics: F[Map[String, List[PartitionInfo]]] = experimental.listTopics
+
+          override def listTopics(timeout: FiniteDuration): F[Map[String, List[PartitionInfo]]] =
+            experimental.listTopics(timeout)
+
+          override def offsetsForTimes(
+            timestampsToSearch: Map[TopicPartition, Long]
+          ): F[Map[TopicPartition, Option[OffsetAndTimestamp]]] =
+            experimental.offsetsForTimes(timestampsToSearch)
+
+          override def offsetsForTimes(
+            timestampsToSearch: Map[TopicPartition, Long],
+            timeout: FiniteDuration
+          ): F[Map[TopicPartition, Option[OffsetAndTimestamp]]] = experimental
+            .offsetsForTimes(timestampsToSearch, timeout)
+
+          override def partitionsFor(topic: String): F[List[PartitionInfo]] = experimental
+            .partitionsFor(topic)
+
+          override def partitionsFor(
+            topic: String,
+            timeout: FiniteDuration
+          ): F[List[PartitionInfo]] = experimental.partitionsFor(topic, timeout)
+
+          override def beginningOffsets(
+            partitions: Set[TopicPartition]
+          ): F[Map[TopicPartition, Long]] = experimental.beginningOffsets(partitions)
+
+          override def beginningOffsets(
+            partitions: Set[TopicPartition],
+            timeout: FiniteDuration
+          ): F[Map[TopicPartition, Long]] = experimental.beginningOffsets(partitions, timeout)
+
+          override def endOffsets(partitions: Set[TopicPartition]): F[Map[TopicPartition, Long]] =
+            experimental.endOffsets(partitions)
+
+          override def endOffsets(
+            partitions: Set[TopicPartition],
+            timeout: FiniteDuration
+          ): F[Map[TopicPartition, Long]] = experimental.endOffsets(partitions, timeout)
+
+        }
+      }
 
   /**
     * Creates a new [[KafkaConsumer]] in the `Stream` context, using the specified

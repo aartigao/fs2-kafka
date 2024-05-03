@@ -373,6 +373,22 @@ sealed abstract class ConsumerSettings[F[_], K, V] {
     */
   def withCredentials(credentialsStore: KafkaCredentialStore): ConsumerSettings[F, K, V]
 
+  /**
+    * Whether to use classic, battle-tested consumer or new lightweight experimental consumer.
+    */
+  def enableExperimentalConsumer: Boolean
+
+  /**
+    * Returns a new [[ConsumerSettings]] instance that will use the experimental consumer. This
+    * consumer is a revamp of the original consumer, aiming to be faster, simpler and with less
+    * memory footprint.
+    *
+    * Note that by default, this setting is set to `false`. As with all experimental features, users
+    * are encouraged to test it first in their Staging (or Pre-Production) environment before
+    * promoting it to Production.
+    */
+  def withEnableExperimentalConsumer(enableExperimentalConsumer: Boolean): ConsumerSettings[F, K, V]
+
 }
 
 object ConsumerSettings {
@@ -388,7 +404,8 @@ object ConsumerSettings {
     override val pollTimeout: FiniteDuration,
     override val commitRecovery: CommitRecovery,
     override val recordMetadata: ConsumerRecord[K, V] => String,
-    override val maxPrefetchBatches: Int
+    override val maxPrefetchBatches: Int,
+    override val enableExperimentalConsumer: Boolean
   ) extends ConsumerSettings[F, K, V] {
 
     override def withCustomBlockingContext(ec: ExecutionContext): ConsumerSettings[F, K, V] =
@@ -522,6 +539,11 @@ object ConsumerSettings {
         recordMetadata = _ => OffsetFetchResponse.NO_METADATA
       )
 
+    override def withEnableExperimentalConsumer(
+      enableExperimentalConsumer: Boolean
+    ): ConsumerSettings[F, K, V] =
+      copy(enableExperimentalConsumer = enableExperimentalConsumer)
+
   }
 
   private[this] def create[F[_], K, V](
@@ -542,7 +564,8 @@ object ConsumerSettings {
       pollTimeout = 50.millis,
       commitRecovery = CommitRecovery.Default,
       recordMetadata = _ => OffsetFetchResponse.NO_METADATA,
-      maxPrefetchBatches = 2
+      maxPrefetchBatches = 2,
+      enableExperimentalConsumer = false
     )
 
   def apply[F[_], K, V](

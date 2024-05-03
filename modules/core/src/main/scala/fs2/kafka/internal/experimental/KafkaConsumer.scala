@@ -10,9 +10,11 @@ import java.time.Duration
 import java.util
 
 import scala.collection.immutable.SortedSet
+import scala.concurrent.duration.FiniteDuration
 import scala.util.matching.Regex
 
 import cats.*
+import cats.data.NonEmptySet
 import cats.effect.*
 import cats.effect.std.*
 import cats.effect.syntax.all.*
@@ -20,7 +22,18 @@ import cats.syntax.all.*
 import fs2.{Chunk, Stream}
 import fs2.concurrent.Topic
 import fs2.kafka.*
-import fs2.kafka.consumer.{KafkaCommit, KafkaConsume, KafkaSubscription, MkConsumer}
+import fs2.kafka.consumer.{
+  KafkaAssignment,
+  KafkaCommit,
+  KafkaConsume,
+  KafkaConsumeChunk,
+  KafkaConsumerLifecycle,
+  KafkaMetrics,
+  KafkaOffsetsV2,
+  KafkaSubscription,
+  KafkaTopicsV2,
+  MkConsumer
+}
 import fs2.kafka.instances.*
 import fs2.kafka.internal.{LogEntry, Logging, WithConsumer}
 import fs2.kafka.internal.converters.collection.*
@@ -30,9 +43,10 @@ import fs2.kafka.internal.syntax.*
 import org.apache.kafka.clients.consumer.{
   ConsumerConfig,
   ConsumerRebalanceListener,
-  OffsetAndMetadata
+  OffsetAndMetadata,
+  OffsetAndTimestamp
 }
-import org.apache.kafka.common.TopicPartition
+import org.apache.kafka.common.{Metric, MetricName, PartitionInfo, TopicPartition}
 
 class KafkaConsumer[F[_], K, V](
   settings: ConsumerSettings[F, K, V],
@@ -44,8 +58,14 @@ class KafkaConsumer[F[_], K, V](
   dispatcher: Dispatcher[F]
 )(implicit F: Async[F], logging: Logging[F], jitter: Jitter[F])
     extends KafkaConsume[F, K, V]
+    with KafkaConsumeChunk[F, K, V]
+    with KafkaAssignment[F]
+    with KafkaOffsetsV2[F]
     with KafkaSubscription[F]
-    with KafkaCommit[F] {
+    with KafkaTopicsV2[F]
+    with KafkaCommit[F]
+    with KafkaMetrics[F]
+    with KafkaConsumerLifecycle[F] {
 
   private[this] val consumerGroupId: Option[String] =
     settings.properties.get(ConsumerConfig.GROUP_ID_CONFIG)
@@ -375,6 +395,126 @@ class KafkaConsumer[F[_], K, V](
 
   private[this] def lost(lost: SortedSet[TopicPartition]): F[Unit] =
     F.raiseError(new UnsupportedOperationException) // TODO
+
+  override def assignment: F[SortedSet[TopicPartition]] = ???
+
+  override def assignmentStream: Stream[F, SortedSet[TopicPartition]] = ???
+
+  override def assign(partitions: NonEmptySet[TopicPartition]): F[Unit] = ???
+
+  override def assign(topic: String): F[Unit] =
+    partitionsFor(topic)
+      .map(partitionInfo => NonEmptySet.fromSet(SortedSet(partitionInfo.map(_.partition)*)))
+      .flatMap(partitions => partitions.fold(F.unit)(assign(topic, _)))
+
+  override def committed(
+    partitions: Set[TopicPartition]
+  ): F[Map[TopicPartition, OffsetAndMetadata]] =
+    withConsumer.blocking { consumer =>
+      consumer.committed(partitions.asJava).toMap
+    }
+
+  override def committed(
+    partitions: Set[TopicPartition],
+    timeout: FiniteDuration
+  ): F[Map[TopicPartition, OffsetAndMetadata]] =
+    withConsumer.blocking { consumer =>
+      consumer.committed(partitions.asJava, timeout.toJava).toMap
+    }
+
+  override def listTopics: F[Map[String, List[PartitionInfo]]] =
+    withConsumer.blocking { consumer =>
+      consumer.listTopics.toMap.map { case (k, v) => (k, v.toList) }
+    }
+
+  override def listTopics(timeout: FiniteDuration): F[Map[String, List[PartitionInfo]]] =
+    withConsumer.blocking { consumer =>
+      consumer.listTopics(timeout.toJava).toMap.map { case (k, v) => (k, v.toList) }
+    }
+
+  override def offsetsForTimes(
+    timestampsToSearch: Map[TopicPartition, Long]
+  ): F[Map[TopicPartition, Option[OffsetAndTimestamp]]] =
+    withConsumer.blocking { consumer =>
+      consumer
+        .offsetsForTimes(
+          timestampsToSearch.asInstanceOf[Map[TopicPartition, java.lang.Long]].asJava
+        )
+        .toMapOptionValues // Convert empty/missing partition null values to None for more idiomatic scala
+    }
+
+  override def offsetsForTimes(
+    timestampsToSearch: Map[TopicPartition, Long],
+    timeout: FiniteDuration
+  ): F[Map[TopicPartition, Option[OffsetAndTimestamp]]] =
+    withConsumer.blocking { consumer =>
+      consumer
+        .offsetsForTimes(
+          timestampsToSearch.asInstanceOf[Map[TopicPartition, java.lang.Long]].asJava,
+          timeout.toJava
+        )
+        .toMapOptionValues // Convert empty/missing partition null values to None for more idiomatic scala
+    }
+
+  override def metrics: F[Map[MetricName, Metric]] =
+    withConsumer.blocking(consumer => consumer.metrics.toMap)
+
+  override def terminate: F[Unit] = ???
+
+  override def awaitTermination: F[Unit] = ???
+
+  override def seek(partition: TopicPartition, offset: Long): F[Unit] =
+    withConsumer.blocking(consumer => consumer.seek(partition, offset))
+
+  override def seekToBeginning[G[_]: Foldable](partitions: G[TopicPartition]): F[Unit] =
+    withConsumer.blocking(consumer => consumer.seekToBeginning(partitions.asJava))
+
+  override def seekToEnd[G[_]: Foldable](partitions: G[TopicPartition]): F[Unit] =
+    withConsumer.blocking(consumer => consumer.seekToEnd(partitions.asJava))
+
+  override def position(partition: TopicPartition): F[Long] =
+    withConsumer.blocking(consumer => consumer.position(partition))
+
+  override def position(partition: TopicPartition, timeout: FiniteDuration): F[Long] =
+    withConsumer.blocking(consumer => consumer.position(partition, timeout.toJava))
+
+  override def partitionsFor(topic: String): F[List[PartitionInfo]] =
+    withConsumer.blocking(consumer => consumer.partitionsFor(topic).toList)
+
+  override def partitionsFor(topic: String, timeout: FiniteDuration): F[List[PartitionInfo]] =
+    withConsumer.blocking(consumer => consumer.partitionsFor(topic, timeout.toJava).toList)
+
+  override def beginningOffsets(partitions: Set[TopicPartition]): F[Map[TopicPartition, Long]] =
+    withConsumer.blocking { consumer =>
+      consumer.beginningOffsets(partitions.asJava).toMap.asInstanceOf[Map[TopicPartition, Long]]
+    }
+
+  override def beginningOffsets(
+    partitions: Set[TopicPartition],
+    timeout: FiniteDuration
+  ): F[Map[TopicPartition, Long]] =
+    withConsumer.blocking { consumer =>
+      consumer
+        .beginningOffsets(partitions.asJava, timeout.toJava)
+        .toMap
+        .asInstanceOf[Map[TopicPartition, Long]]
+    }
+
+  override def endOffsets(partitions: Set[TopicPartition]): F[Map[TopicPartition, Long]] =
+    withConsumer.blocking { consumer =>
+      consumer.endOffsets(partitions.asJava).toMap.asInstanceOf[Map[TopicPartition, Long]]
+    }
+
+  override def endOffsets(
+    partitions: Set[TopicPartition],
+    timeout: FiniteDuration
+  ): F[Map[TopicPartition, Long]] =
+    withConsumer.blocking { consumer =>
+      consumer
+        .endOffsets(partitions.asJava, timeout.toJava)
+        .toMap
+        .asInstanceOf[Map[TopicPartition, Long]]
+    }
 
 }
 
